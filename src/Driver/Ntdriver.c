@@ -3429,31 +3429,21 @@ void TCDeleteDeviceObject (PDEVICE_OBJECT DeviceObject, PEXTENSION Extension)
 
 		if (Extension->SecurityClientContextValid)
 		{
-			if (OsMajorVersion == 5 && OsMinorVersion == 0)
-			{
-				ObDereferenceObject (Extension->SecurityClientContext.ClientToken);
-			}
-			else
-			{
-				// Windows 2000 does not support PsDereferenceImpersonationToken() used by SeDeleteClientSecurity().
-				// TODO: Use only SeDeleteClientSecurity() once support for Windows 2000 is dropped.
+			VOID (*PsDereferenceImpersonationTokenD) (PACCESS_TOKEN ImpersonationToken);
+			UNICODE_STRING name;
+			RtlInitUnicodeString (&name, L"PsDereferenceImpersonationToken");
 
-				VOID (*PsDereferenceImpersonationTokenD) (PACCESS_TOKEN ImpersonationToken);
-				UNICODE_STRING name;
-				RtlInitUnicodeString (&name, L"PsDereferenceImpersonationToken");
+			PsDereferenceImpersonationTokenD = MmGetSystemRoutineAddress (&name);
+			if (!PsDereferenceImpersonationTokenD)
+				TC_BUG_CHECK (STATUS_NOT_IMPLEMENTED);
 
-				PsDereferenceImpersonationTokenD = MmGetSystemRoutineAddress (&name);
-				if (!PsDereferenceImpersonationTokenD)
-					TC_BUG_CHECK (STATUS_NOT_IMPLEMENTED);
+#			define PsDereferencePrimaryToken
+#			define PsDereferenceImpersonationToken PsDereferenceImpersonationTokenD
 
-#				define PsDereferencePrimaryToken
-#				define PsDereferenceImpersonationToken PsDereferenceImpersonationTokenD
+			SeDeleteClientSecurity (&Extension->SecurityClientContext);
 
-				SeDeleteClientSecurity (&Extension->SecurityClientContext);
-
-#				undef PsDereferencePrimaryToken
-#				undef PsDereferenceImpersonationToken
-			}
+#			undef PsDereferencePrimaryToken
+#			undef PsDereferenceImpersonationToken
 		}
 
 		VirtualVolumeDeviceObjects[Extension->nDosDriveNo] = NULL;
@@ -3653,11 +3643,16 @@ NTSTATUS ProbeRealDriveSize (PDEVICE_OBJECT driveDeviceObject, LARGE_INTEGER *dr
 	LARGE_INTEGER offset;
 	byte *sectorBuffer;
 	ULONGLONG startTime;
+	ULONG sectorSize;
 
 	if (!UserCanAccessDriveDevice())
 		return STATUS_ACCESS_DENIED;
 
-	sectorBuffer = TCalloc (TC_SECTOR_SIZE_BIOS);
+	status = GetDeviceSectorSize (driveDeviceObject, &sectorSize);
+	if (!NT_SUCCESS (status))
+		return status;
+
+	sectorBuffer = TCalloc (sectorSize);
 	if (!sectorBuffer)
 		return STATUS_INSUFFICIENT_RESOURCES;
 
@@ -3672,12 +3667,12 @@ NTSTATUS ProbeRealDriveSize (PDEVICE_OBJECT driveDeviceObject, LARGE_INTEGER *dr
 	}
 
 	startTime = KeQueryInterruptTime ();
-	for (offset.QuadPart = sysLength.QuadPart; ; offset.QuadPart += TC_SECTOR_SIZE_BIOS)
+	for (offset.QuadPart = sysLength.QuadPart; ; offset.QuadPart += sectorSize)
 	{
-		status = TCReadDevice (driveDeviceObject, sectorBuffer, offset, TC_SECTOR_SIZE_BIOS);
+		status = TCReadDevice (driveDeviceObject, sectorBuffer, offset, sectorSize);
 
 		if (NT_SUCCESS (status))
-			status = TCWriteDevice (driveDeviceObject, sectorBuffer, offset, TC_SECTOR_SIZE_BIOS);
+			status = TCWriteDevice (driveDeviceObject, sectorBuffer, offset, sectorSize);
 
 		if (!NT_SUCCESS (status))
 		{
