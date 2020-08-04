@@ -9603,7 +9603,7 @@ static DWORD WINAPI SystemFavoritesServiceCtrlHandler (	DWORD dwControl,
 	case SERVICE_CONTROL_STOP:
 		SystemFavoritesServiceSetStatus (SERVICE_STOP_PENDING);
 
-		if (!(BootEncObj->ReadServiceConfigurationFlags () & VC_SYSTEM_FAVORITES_SERVICE_CONFIG_DONT_UPDATE_LOADER))
+ 		if (!(BootEncObj->ReadServiceConfigurationFlags () & VC_SYSTEM_FAVORITES_SERVICE_CONFIG_DONT_UPDATE_LOADER))
 		{
 			try
 			{
@@ -11310,6 +11310,11 @@ void SetDriverConfigurationFlag (uint32 flag, BOOL state)
 		BootEncObj->SetDriverConfigurationFlag (flag, state ? true : false);
 }
 
+void SetServiceConfigurationFlag (uint32 flag, BOOL state)
+{
+	if (BootEncObj)
+		BootEncObj->SetServiceConfigurationFlag (flag, state ? true : false);
+}
 
 static BOOL CALLBACK PerformanceSettingsDlgProc (HWND hwndDlg, UINT msg, WPARAM wParam, LPARAM lParam)
 {
@@ -11462,7 +11467,26 @@ static BOOL CALLBACK PerformanceSettingsDlgProc (HWND hwndDlg, UINT msg, WPARAM 
 					{
 						BOOL originalRamEncryptionEnabled = (driverConfig & VC_DRIVER_CONFIG_ENABLE_RAM_ENCRYPTION)? TRUE : FALSE;
 						if (originalRamEncryptionEnabled != enableRamEncryption)
+						{
+							if (enableRamEncryption)
+							{
+								// Disable Hibernate and Fast Startup if they are enabled
+								BOOL bHibernateEnabled, bHiberbootEnabled;
+								if (GetHibernateStatus (bHibernateEnabled, bHiberbootEnabled))
+								{
+									if (bHibernateEnabled)
+									{										
+										BootEncObj->WriteLocalMachineRegistryDwordValue (L"SYSTEM\\CurrentControlSet\\Control\\Power", L"HibernateEnabled", 0);
+									}
+
+									if (bHiberbootEnabled)
+									{										
+										BootEncObj->WriteLocalMachineRegistryDwordValue (L"SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Power", L"HiberbootEnabled", 0);
+									}
+								}
+							}
 							rebootRequired = true;
+						}
 						SetDriverConfigurationFlag (VC_DRIVER_CONFIG_ENABLE_RAM_ENCRYPTION, enableRamEncryption);
 					}
 
@@ -11538,7 +11562,25 @@ static BOOL CALLBACK PerformanceSettingsDlgProc (HWND hwndDlg, UINT msg, WPARAM 
 				BOOL enableRamEncryption = IsDlgButtonChecked (hwndDlg, IDC_ENABLE_RAM_ENCRYPTION);
 
 				if (originalRamEncryptionEnabled != enableRamEncryption)
+				{
+					if (enableRamEncryption)
+					{
+						// check if Hibernate or Fast Startup are enabled
+						BOOL bHibernateEnabled, bHiberbootEnabled;
+						if (GetHibernateStatus (bHibernateEnabled, bHiberbootEnabled))
+						{
+							if (bHibernateEnabled || bHiberbootEnabled)
+							{
+								if (AskWarnYesNo ("RAM_ENCRYPTION_DISABLE_HIBERNATE", hwndDlg) == IDNO)
+								{
+									CheckDlgButton (hwndDlg, IDC_ENABLE_RAM_ENCRYPTION, BST_UNCHECKED);
+									return 1;
+								}
+							}
+						}
+					}
 					Warning ("SETTING_REQUIRES_REBOOT", hwndDlg);
+				}
 			}
 			return 1;
 
@@ -11811,6 +11853,7 @@ static BOOL CALLBACK BootLoaderPreferencesDlgProc (HWND hwndDlg, UINT msg, WPARA
 			{
 				LocalizeDialog (hwndDlg, "IDD_SYSENC_SETTINGS");
 				uint32 driverConfig = ReadDriverConfigurationFlags();
+				uint32 serviceConfig = ReadServiceConfigurationFlags();
 				byte userConfig;
 				string customUserMessage;
 				uint16 bootLoaderVersion = 0;
@@ -11818,6 +11861,17 @@ static BOOL CALLBACK BootLoaderPreferencesDlgProc (HWND hwndDlg, UINT msg, WPARA
 				BOOL bPimCacheEnabled = (driverConfig & TC_DRIVER_CONFIG_CACHE_BOOT_PIM)? TRUE : FALSE;
 				BOOL bBlockSysEncTrimEnabled = (driverConfig & VC_DRIVER_CONFIG_BLOCK_SYS_TRIM)? TRUE : FALSE;
 				BOOL bClearKeysEnabled = (driverConfig & VC_DRIVER_CONFIG_CLEAR_KEYS_ON_NEW_DEVICE_INSERTION)? TRUE : FALSE;
+				BOOL bAutoFixBootloader = (serviceConfig & VC_SYSTEM_FAVORITES_SERVICE_CONFIG_DONT_UPDATE_LOADER)? FALSE : TRUE;
+				BOOL bForceVeraCryptNextBoot = FALSE;
+				BOOL bForceSetVeraCryptBootEntry = TRUE;
+				BOOL bForceVeraCryptFirstEntry = TRUE;
+				if (bSystemIsGPT)
+				{
+					bForceVeraCryptNextBoot = (serviceConfig & VC_SYSTEM_FAVORITES_SERVICE_CONFIG_FORCE_SET_BOOTNEXT)? TRUE : FALSE;
+					bForceSetVeraCryptBootEntry = (serviceConfig & VC_SYSTEM_FAVORITES_SERVICE_CONFIG_DONT_SET_BOOTENTRY)? FALSE : TRUE;
+					bForceVeraCryptFirstEntry = (serviceConfig & VC_SYSTEM_FAVORITES_SERVICE_CONFIG_DONT_FORCE_FIRST_BOOTENTRY)? FALSE : TRUE;
+				}
+
 				BOOL bIsHiddenOS = IsHiddenOSRunning ();
 
 				if (bClearKeysEnabled)
@@ -11882,6 +11936,25 @@ static BOOL CALLBACK BootLoaderPreferencesDlgProc (HWND hwndDlg, UINT msg, WPARA
 				}
 				else
 					CheckDlgButton (hwndDlg, IDC_BLOCK_SYSENC_TRIM, bBlockSysEncTrimEnabled ? BST_CHECKED : BST_UNCHECKED);
+
+				CheckDlgButton (hwndDlg, IDC_UPDATE_BOOTLOADER_ON_SHUTDOWN, bAutoFixBootloader? BST_CHECKED : BST_UNCHECKED);
+				if (bSystemIsGPT)
+				{
+					if (!bAutoFixBootloader || bIsHiddenOS)
+					{
+						// we disable other options if updating bootloader is not allowed or if hidden OS us running
+						EnableWindow (GetDlgItem (hwndDlg, IDC_FORCE_NEXT_BOOT_VERACRYPT), FALSE);
+						EnableWindow (GetDlgItem (hwndDlg, IDC_FORCE_VERACRYPT_BOOT_ENTRY), FALSE);
+						EnableWindow (GetDlgItem (hwndDlg, IDC_FORCE_VERACRYPT_FIRST_BOOT_ENTRY), FALSE);
+					}
+					
+					if (!bIsHiddenOS)
+					{
+						CheckDlgButton (hwndDlg, IDC_FORCE_NEXT_BOOT_VERACRYPT, bForceVeraCryptNextBoot? BST_CHECKED : BST_UNCHECKED);
+						CheckDlgButton (hwndDlg, IDC_FORCE_VERACRYPT_BOOT_ENTRY, bForceSetVeraCryptBootEntry? BST_CHECKED : BST_UNCHECKED);
+						CheckDlgButton (hwndDlg, IDC_FORCE_VERACRYPT_FIRST_BOOT_ENTRY, bForceVeraCryptFirstEntry? BST_CHECKED : BST_UNCHECKED);
+					}
+				}
 			}
 			catch (Exception &e)
 			{
@@ -11992,6 +12065,17 @@ static BOOL CALLBACK BootLoaderPreferencesDlgProc (HWND hwndDlg, UINT msg, WPARA
 					BOOL bBlockSysEncTrimEnabled = IsDlgButtonChecked (hwndDlg, IDC_BLOCK_SYSENC_TRIM);
 					BOOL bClearKeysEnabled = IsDlgButtonChecked (hwndDlg, IDC_CLEAR_KEYS_ON_NEW_DEVICE_INSERTION);
 
+					BOOL bAutoFixBootloader = IsDlgButtonChecked (hwndDlg, IDC_UPDATE_BOOTLOADER_ON_SHUTDOWN);
+					BOOL bForceVeraCryptNextBoot = FALSE;
+					BOOL bForceSetVeraCryptBootEntry = TRUE;
+					BOOL bForceVeraCryptFirstEntry = TRUE;
+					if (bSystemIsGPT)
+					{
+						bForceVeraCryptNextBoot = IsDlgButtonChecked (hwndDlg, IDC_FORCE_NEXT_BOOT_VERACRYPT);
+						bForceSetVeraCryptBootEntry = IsDlgButtonChecked (hwndDlg, IDC_FORCE_VERACRYPT_BOOT_ENTRY);
+						bForceVeraCryptFirstEntry = IsDlgButtonChecked (hwndDlg, IDC_FORCE_VERACRYPT_FIRST_BOOT_ENTRY);
+					}
+
 					if (bClearKeysEnabled && !BootEncObj->IsSystemFavoritesServiceRunning())
 					{
 						// the system favorite service service should be running
@@ -12010,8 +12094,23 @@ static BOOL CALLBACK BootLoaderPreferencesDlgProc (HWND hwndDlg, UINT msg, WPARA
 					SetDriverConfigurationFlag (TC_DRIVER_CONFIG_CACHE_BOOT_PIM, (bPasswordCacheEnabled && bPimCacheEnabled)? TRUE : FALSE);
 					SetDriverConfigurationFlag (TC_DRIVER_CONFIG_DISABLE_EVIL_MAID_ATTACK_DETECTION, IsDlgButtonChecked (hwndDlg, IDC_DISABLE_EVIL_MAID_ATTACK_DETECTION));
 					SetDriverConfigurationFlag (VC_DRIVER_CONFIG_CLEAR_KEYS_ON_NEW_DEVICE_INSERTION, bClearKeysEnabled);
-					if (!IsHiddenOSRunning ()) /* we don't need to update TRIM config for hidden OS since it's always blocked */
+					SetServiceConfigurationFlag (VC_SYSTEM_FAVORITES_SERVICE_CONFIG_DONT_UPDATE_LOADER, bAutoFixBootloader? FALSE : TRUE);
+					if (!IsHiddenOSRunning ())
+					{
+						/* we don't need to update TRIM config for hidden OS since it's always blocked */
 						SetDriverConfigurationFlag (VC_DRIVER_CONFIG_BLOCK_SYS_TRIM, bBlockSysEncTrimEnabled);
+
+						if (bSystemIsGPT)
+						{
+							if (bAutoFixBootloader)
+							{
+								/* we update bootloader settings only if the autofix option is enabled */
+								SetServiceConfigurationFlag (VC_SYSTEM_FAVORITES_SERVICE_CONFIG_FORCE_SET_BOOTNEXT, bForceVeraCryptNextBoot);
+								SetServiceConfigurationFlag (VC_SYSTEM_FAVORITES_SERVICE_CONFIG_DONT_SET_BOOTENTRY, bForceSetVeraCryptBootEntry? FALSE : TRUE);
+								SetServiceConfigurationFlag (VC_SYSTEM_FAVORITES_SERVICE_CONFIG_DONT_FORCE_FIRST_BOOTENTRY, bForceVeraCryptFirstEntry? FALSE : TRUE);
+							}
+						}
+					}
 				}
 				catch (Exception &e)
 				{
@@ -12071,6 +12170,24 @@ static BOOL CALLBACK BootLoaderPreferencesDlgProc (HWND hwndDlg, UINT msg, WPARA
 					Warning ("CLEAR_KEYS_ON_DEVICE_INSERTION_WARNING", hwndDlg);
 			}
 
+			break;
+
+		case IDC_UPDATE_BOOTLOADER_ON_SHUTDOWN:
+			if (bSystemIsGPT && !IsHiddenOSRunning ())
+			{
+				if (IsDlgButtonChecked (hwndDlg, IDC_UPDATE_BOOTLOADER_ON_SHUTDOWN))
+				{
+					EnableWindow (GetDlgItem (hwndDlg, IDC_FORCE_NEXT_BOOT_VERACRYPT), TRUE);
+					EnableWindow (GetDlgItem (hwndDlg, IDC_FORCE_VERACRYPT_BOOT_ENTRY), TRUE);
+					EnableWindow (GetDlgItem (hwndDlg, IDC_FORCE_VERACRYPT_FIRST_BOOT_ENTRY), TRUE);
+				}
+				else
+				{
+					EnableWindow (GetDlgItem (hwndDlg, IDC_FORCE_NEXT_BOOT_VERACRYPT), FALSE);
+					EnableWindow (GetDlgItem (hwndDlg, IDC_FORCE_VERACRYPT_BOOT_ENTRY), FALSE);
+					EnableWindow (GetDlgItem (hwndDlg, IDC_FORCE_VERACRYPT_FIRST_BOOT_ENTRY), FALSE);
+				}
+			}
 			break;
 		}
 		return 0;
