@@ -238,7 +238,7 @@ namespace VeraCrypt
 		while (true)
 		{
 			wxString s = AskString (StringFormatter (L"{0} (y={1}/n={2}) [{3}]: ",
-				message, LangString["YES"], LangString["NO"], LangString[defaultYes ? "YES" : "NO"]));
+				message, LangString["UISTR_YES"], LangString["UISTR_NO"], LangString[defaultYes ? "UISTR_YES" : "UISTR_NO"]));
 
 			if (s.IsSameAs (L'n', false) || s.IsSameAs (L"no", false) || (!defaultYes && s.empty()))
 				return false;
@@ -810,7 +810,7 @@ namespace VeraCrypt
 		}
 
 		if (options->Filesystem == VolumeCreationOptions::FilesystemType::Btrfs
-			&& (filesystemSize < VC_MIN_BTRFS_VOLUME_SIZE))
+			&& (filesystemSize < VC_MIN_SMALL_BTRFS_VOLUME_SIZE))
 		{
 			throw_err (_("Specified volume size is too small to be used with Btrfs filesystem."));
 		}
@@ -939,7 +939,14 @@ namespace VeraCrypt
 				args.push_back ("-f");
 
 			if (options->Filesystem == VolumeCreationOptions::FilesystemType::Btrfs)
+			{
 				args.push_back ("-f");
+				if (filesystemSize < VC_MIN_LARGE_BTRFS_VOLUME_SIZE)
+				{
+					// use mixed mode for small BTRFS volumes
+					args.push_back ("-M");
+				}
+			}
 
 			args.push_back (string (virtualDevice));
 
