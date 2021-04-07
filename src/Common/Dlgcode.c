@@ -22,13 +22,13 @@
 #include <io.h>
 #include <math.h>
 #include <shlobj.h>
+#include <shlwapi.h>
 #include <sys/stat.h>
 #include <stdlib.h>
 #include <time.h>
 #include <tchar.h>
 #include <Richedit.h>
 #if defined (TCMOUNT) || defined (VOLFORMAT)
-#include <Shlwapi.h>
 #include <process.h>
 #include <Tlhelp32.h>
 #endif
@@ -235,7 +235,8 @@ static std::vector<HostDevice> rawHostDeviceList;
 CRITICAL_SECTION csSecureDesktop;
 
 /* Boolean that indicates if our Secure Desktop is active and being used or not */
-BOOL bSecureDesktopOngoing = FALSE;
+volatile BOOL bSecureDesktopOngoing = FALSE;
+TCHAR SecureDesktopName[65];
 
 HINSTANCE hInst = NULL;
 HCURSOR hCursor = NULL;
@@ -344,6 +345,13 @@ typedef LSTATUS (STDAPICALLTYPE *SHDeleteKeyWPtr)(HKEY hkey, LPCWSTR pszSubKey);
 
 typedef HRESULT (STDAPICALLTYPE *SHStrDupWPtr)(LPCWSTR psz, LPWSTR *ppwsz);
 
+typedef HRESULT (STDAPICALLTYPE *UrlUnescapeWPtr)(
+  PWSTR pszUrl,
+  PWSTR pszUnescaped,
+  DWORD *pcchUnescaped,
+  DWORD dwFlags
+);
+
 // ChangeWindowMessageFilter
 typedef BOOL (WINAPI *ChangeWindowMessageFilterPtr) (UINT, DWORD);
 
@@ -372,6 +380,7 @@ SetupInstallFromInfSectionWPtr SetupInstallFromInfSectionWFn = NULL;
 SetupOpenInfFileWPtr SetupOpenInfFileWFn = NULL;
 SHDeleteKeyWPtr SHDeleteKeyWFn = NULL;
 SHStrDupWPtr SHStrDupWFn = NULL;
+UrlUnescapeWPtr UrlUnescapeWFn = NULL;
 ChangeWindowMessageFilterPtr ChangeWindowMessageFilterFn = NULL;
 CreateProcessWithTokenWFn CreateProcessWithTokenWPtr = NULL;
 
@@ -3100,10 +3109,11 @@ void InitApp (HINSTANCE hInstance, wchar_t *lpszCommandLine)
 	if (!SetupCloseInfFileFn || !SetupDiOpenClassRegKeyFn || !SetupInstallFromInfSectionWFn || !SetupOpenInfFileWFn)
 		AbortProcess ("INIT_DLL");
 
-	// Get SHDeleteKeyW function pointer
+	// Get SHDeleteKeyW,SHStrDupW, UrlUnescapeW functions pointers
 	SHDeleteKeyWFn = (SHDeleteKeyWPtr) GetProcAddress (hShlwapiDll, "SHDeleteKeyW");
 	SHStrDupWFn = (SHStrDupWPtr) GetProcAddress (hShlwapiDll, "SHStrDupW");
-	if (!SHDeleteKeyWFn || !SHStrDupWFn)
+	UrlUnescapeWFn = (UrlUnescapeWPtr) GetProcAddress(hShlwapiDll, "UrlUnescapeW");
+	if (!SHDeleteKeyWFn || !SHStrDupWFn || !UrlUnescapeWFn)
 		AbortProcess ("INIT_DLL");
 
 	if (IsOSAtLeast (WIN_VISTA))
@@ -9513,8 +9523,11 @@ BOOL PrintHardCopyTextUTF16 (wchar_t *text, wchar_t *title, size_t textByteLen)
 
 BOOL IsNonInstallMode ()
 {
-	HKEY hkey;
+	HKEY hkey, hkeybis;
 	DWORD dw;
+	WCHAR szBuffer[512];
+    DWORD dwBufferSize = sizeof(szBuffer);
+	std::wstring msiProductGUID;
 
 	if (bPortableModeConfirmed)
 		return TRUE;
@@ -9571,6 +9584,29 @@ BOOL IsNonInstallMode ()
 		else
 			CloseHandle (hDriverTmp);
 	}
+
+	// The following test checks whether the MSI is installed, which means we're not in portable mode.
+	// The ProductGUID is read from registry.
+    if (RegOpenKeyEx(HKEY_LOCAL_MACHINE, L"Software\\VeraCrypt_MSI", 0, KEY_QUERY_VALUE | KEY_WOW64_32KEY, &hkey) == ERROR_SUCCESS ||
+        RegOpenKeyEx(HKEY_LOCAL_MACHINE, L"Software\\VeraCrypt_MSI", 0, KEY_QUERY_VALUE, &hkey) == ERROR_SUCCESS)
+    {
+        if (ERROR_SUCCESS == RegQueryValueExW(hkey, L"ProductGuid", 0, NULL, (LPBYTE)szBuffer, &dwBufferSize))
+        {
+            msiProductGUID = szBuffer;
+
+            std::wstring regKey = L"Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\";
+            regKey += msiProductGUID;
+
+            if (RegOpenKeyEx(HKEY_LOCAL_MACHINE, regKey.c_str(), 0, KEY_READ | KEY_WOW64_32KEY, &hkeybis) == ERROR_SUCCESS ||
+                RegOpenKeyEx(HKEY_LOCAL_MACHINE, regKey.c_str(), 0, KEY_READ, &hkeybis) == ERROR_SUCCESS)
+            {
+                RegCloseKey(hkeybis);
+                return FALSE;
+            }
+        }
+
+        RegCloseKey(hkey);
+    }
 
 	// The following test may be unreliable in some cases (e.g. after the user selects restore "Last Known Good
 	// Configuration" from the Windows boot menu).
@@ -11190,15 +11226,33 @@ void Applink (const char *dest)
 		CorrectURL (url);
 	}
 
-	if (IsAdmin ())
+	if (IsOSAtLeast (WIN_VISTA) && IsAdmin ())
 	{
-		if (buildUrl && !FileExists (url))
+		int openDone = 0;
+		if (buildUrl)
 		{
-			// fallbacl to online resources
-			StringCbPrintfW (url, sizeof (url), L"https://www.veracrypt.fr/en/%s", page);
-			SafeOpenURL (url);
+			wchar_t pageFileName [TC_MAX_PATH] = {0};
+			DWORD cchUnescaped = ARRAYSIZE(pageFileName);
+
+			StringCbCopyW (pageFileName, sizeof(pageFileName), page);
+			/* remove escape sequences from the page name before calling FileExists function */
+			if (S_OK == UrlUnescapeWFn (pageFileName, pageFileName, &cchUnescaped, URL_UNESCAPE_INPLACE))
+			{
+				std::wstring pageFullPath = installDir;
+				pageFullPath += L"docs\\html\\en\\";
+				pageFullPath += pageFileName;
+			
+				if (!FileExists (pageFullPath.c_str()))
+				{
+					// fallback to online resources
+					StringCbPrintfW (url, sizeof (url), L"https://www.veracrypt.fr/en/%s", page);
+					SafeOpenURL (url);
+					openDone = 1;
+				}
+			}
 		}
-		else
+
+		if (!openDone)
 		{
 			SafeOpenURL (url);
 		}
@@ -11209,7 +11263,7 @@ void Applink (const char *dest)
 
 		if (((r == ERROR_FILE_NOT_FOUND) || (r == ERROR_PATH_NOT_FOUND)) && buildUrl)
 		{
-			// fallbacl to online resources
+			// fallback to online resources
 			StringCbPrintfW (url, sizeof (url), L"https://www.veracrypt.fr/en/%s", page);
 			ShellExecuteW (NULL, L"open", url, NULL, NULL, SW_SHOWNORMAL);
 		}			
@@ -11307,12 +11361,21 @@ BYTE *MapResource (wchar_t *resourceType, int resourceId, PDWORD size)
 {
 	HGLOBAL hResL;
     HRSRC hRes;
+    HINSTANCE hResInst = NULL;
 
-	hRes = FindResource (NULL, MAKEINTRESOURCE(resourceId), resourceType);
-	hResL = LoadResource (NULL, hRes);
+#ifdef SETUP_DLL
+	//	In case we're being called from the SetupDLL project, FindResource()
+	//	and LoadResource() with NULL will fail since we're in a DLL. We need
+	//	to call them with the HINSTANCE of the DLL instead, which we set in 
+	//	Setup.c of SetupDLL, DllMain() function.
+    hResInst = hInst;
+#endif
+
+	hRes = FindResource (hResInst, MAKEINTRESOURCE(resourceId), resourceType);
+	hResL = LoadResource (hResInst, hRes);
 
 	if (size != NULL)
-		*size = SizeofResource (NULL, hRes);
+		*size = SizeofResource (hResInst, hRes);
 
 	return (BYTE *) LockResource (hResL);
 }
@@ -12196,6 +12259,35 @@ BOOL CALLBACK SecurityTokenKeyfileDlgProc (HWND hwndDlg, UINT msg, WPARAM wParam
 	return 0;
 }
 
+extern "C" BOOL IsThreadInSecureDesktop(DWORD dwThreadID)
+{
+	BOOL bRet = FALSE;
+	if (bSecureDesktopOngoing)
+	{
+		HDESK currentDesk = GetThreadDesktop (dwThreadID);
+		if (currentDesk)
+		{
+			LPWSTR szName = NULL;
+			DWORD dwLen = 0;
+			if (!GetUserObjectInformation (currentDesk, UOI_NAME, NULL, 0, &dwLen))
+			{
+				szName = (LPWSTR) malloc (dwLen);
+				if (szName)
+				{
+					if (GetUserObjectInformation (currentDesk, UOI_NAME, szName, dwLen, &dwLen))
+					{
+						if (0 == _wcsicmp (szName, SecureDesktopName))
+							bRet = TRUE;
+					}
+					free (szName);
+				}
+			}
+		}
+	}
+
+	return bRet;
+}
+
 
 BOOL InitSecurityTokenLibrary (HWND hwndDlg)
 {
@@ -12220,6 +12312,8 @@ BOOL InitSecurityTokenLibrary (HWND hwndDlg)
 				HWND hParent = IsWindow (m_hwnd)? m_hwnd : GetActiveWindow();
 				if (!hParent)
 					hParent = GetForegroundWindow ();
+				if (IsThreadInSecureDesktop(GetCurrentThreadId()) && !IsThreadInSecureDesktop(GetWindowThreadProcessId(hParent, NULL)))
+					hParent = GetActiveWindow ();
 				if (SecureDesktopDialogBoxParam (hInst, MAKEINTRESOURCEW (IDD_TOKEN_PASSWORD), hParent, (DLGPROC) SecurityTokenPasswordDlgProc, (LPARAM) &str) == IDCANCEL)
 					throw UserAbort (SRC_POS);
 			}
@@ -13829,7 +13923,7 @@ INT_PTR SecureDesktopDialogBoxParam(
 	INT_PTR retValue = 0;
 	BOOL bEffectiveUseSecureDesktop = bCmdUseSecureDesktopValid? bCmdUseSecureDesktop : bUseSecureDesktop;
 
-	if (bEffectiveUseSecureDesktop)
+	if (bEffectiveUseSecureDesktop && !IsThreadInSecureDesktop(GetCurrentThreadId()))
 	{
 		EnterCriticalSection (&csSecureDesktop);
 		bSecureDesktopOngoing = TRUE;
@@ -13875,6 +13969,8 @@ INT_PTR SecureDesktopDialogBoxParam(
 				HANDLE hThread = ::CreateThread (NULL, 0, SecureDesktopThread, (LPVOID) &param, 0, NULL);
 				if (hThread)
 				{
+					StringCbCopy(SecureDesktopName, sizeof (SecureDesktopName), szDesktopName);
+
 					WaitForSingleObject (hThread, INFINITE);
 					CloseHandle (hThread);
 
